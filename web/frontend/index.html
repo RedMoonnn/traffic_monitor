@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>流量监控信息展示</title>
+    <script src="https://cdn.jsdelivr.net/npm/echarts/dist/echarts.min.js"></script>
+    <style>
+        body { font-family: "微软雅黑", Arial, sans-serif; background: #fff; margin: 0; }
+        .container { width: 98vw; max-width: 100vw; margin: 30px auto; }
+        .charts { display: flex; justify-content: center; align-items: flex-start; margin-top: 40px; width: 100%; }
+        .chart-block { width: 38%; min-width: 320px; max-width: 900px; margin: 0 1%; }
+        .chart-title { font-size: 16px; font-weight: bold; margin-bottom: 8px; margin-left: 8px; }
+        .chart { width: 100%; height: 320px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 40px; background: #fff; }
+        th, td { border: 1px solid #e0e0e0; padding: 10px 8px; text-align: center; font-size: 15px; word-break: break-all; }
+        th { background: #fafbfc; font-weight: 600; }
+        caption { margin-top: 20px; font-size: 18px; font-weight: bold; }
+        tr:nth-child(even) { background: #f7f9fa; }
+        @media (max-width: 1300px) {
+            .container { width: 100vw; }
+            .chart-block { width: 100%; min-width: 0; max-width: 100vw; margin-bottom: 30px; }
+            .charts { flex-direction: column; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="charts">
+        <div class="chart-block">
+            <div class="chart-title">发送速率</div>
+            <div id="sendChart" class="chart"></div>
+        </div>
+        <div class="chart-block">
+            <div class="chart-title">接收速率</div>
+            <div id="recvChart" class="chart"></div>
+        </div>
+    </div>
+    <table>
+        <caption>流量统计信息</caption>
+        <thead>
+        <tr>
+            <th>目的(源)IP地址</th>
+            <th>数据包方向</th>
+            <th>累计总量</th>
+            <th>峰值流量</th>
+            <th>平均流量（过去2s）</th>
+            <th>平均流量（过去10s）</th>
+            <th>平均流量（过去40s）</th>
+        </tr>
+        </thead>
+        <tbody id="trafficTable">
+        <!-- JS填充 -->
+        </tbody>
+    </table>
+</div>
+<script>
+    // 初始化 ECharts 实例
+    const sendChart = echarts.init(document.getElementById('sendChart'));
+    const recvChart = echarts.init(document.getElementById('recvChart'));
+
+    // 保证图表自适应窗口
+    window.addEventListener('resize', () => {
+        sendChart.resize();
+        recvChart.resize();
+    });
+
+    // 动态拉取数据并刷新页面
+    async function fetchAndUpdate() {
+        try {
+            // 拉取分IP分方向历史数据
+            const res = await fetch('http://172.30.127.8:5000/api/ip_history');
+            const history = await res.json(); // [ [ {...}, {...} ], ... ]
+            if (!Array.isArray(history) || history.length === 0) {
+                sendChart.clear();
+                recvChart.clear();
+                document.getElementById('trafficTable').innerHTML = '';
+                return;
+            }
+            // 横坐标动态推进，显示真实运行秒数（1~totalLen）
+            const totalLen = history.length;
+            const data = history; // 全量数据
+            const time = Array.from({length: totalLen}, (_, i) => i + 1);
+            // legend: 所有历史数据中出现过的 ip-direction
+            const legendSet = new Set();
+            data.forEach(group => {
+                group.forEach(item => {
+                    legendSet.add(item.ip + '-' + item.direction);
+                });
+            });
+            const legend = Array.from(legendSet);
+            // 组装series
+            function buildSeries(direction) {
+                return legend.filter(lg => lg.endsWith('-' + direction)).map(lg => {
+                    const [ip, dir] = lg.split('-');
+                    return {
+                        name: ip,
+                        type: 'line',
+                        data: data.map(group => {
+                            const found = group.find(item => item.ip === ip && item.direction === direction);
+                            return found ? found.peak : 0;
+                        }),
+                        smooth: true,
+                        symbol: 'circle',
+                        symbolSize: 8,
+                        label: { show: false },
+                        lineStyle: { width: 2 }
+                    };
+                });
+            }
+            // 计算每个ip+direction的峰值速率
+            const peakMap = new Map();
+            data.forEach(group => {
+                group.forEach(item => {
+                    const key = item.ip + '-' + item.direction;
+                    if (!peakMap.has(key) || item.peak > peakMap.get(key)) {
+                        peakMap.set(key, item.peak);
+                    }
+                });
+            });
+            // 发送速率图（direction=send）
+            sendChart.setOption({
+                title: { show: false },
+                tooltip: { trigger: 'axis' },
+                legend: { data: legend.filter(lg => lg.endsWith('-send')).map(lg => lg.split('-')[0]), top: 16 },
+                grid: { left: 60, right: 30, top: 60, bottom: 50 },
+                xAxis: {
+                    type: 'category',
+                    data: time,
+                    name: '运行时间(秒)',
+                    nameLocation: 'middle',
+                    nameGap: 30,
+                    boundaryGap: false,
+                    axisLabel: {
+                        interval: function(index, value) {
+                            if (time.length > 60) {
+                                return index % Math.ceil(time.length / 20) === 0;
+                            }
+                            return true;
+                        },
+                        rotate: 30,
+                        hideOverlap: true
+                    }
+                },
+                yAxis: {
+                    type: 'value',
+                    name: '单位(b/s)',
+                    min: 'dataMin',
+                    max: 'dataMax',
+                    axisLabel: {
+                        interval: 'auto',
+                        rotate: 30,
+                        formatter: function(value) {
+                            return value.toLocaleString() + ' b/s';
+                        }
+                    }
+                },
+                series: buildSeries('send')
+            });
+            // 接收速率图（direction=recv）
+            recvChart.setOption({
+                title: { show: false },
+                tooltip: { trigger: 'axis' },
+                legend: { data: legend.filter(lg => lg.endsWith('-recv')).map(lg => lg.split('-')[0]), top: 16 },
+                grid: { left: 60, right: 30, top: 60, bottom: 50 },
+                xAxis: {
+                    type: 'category',
+                    data: time,
+                    name: '运行时间(秒)',
+                    nameLocation: 'middle',
+                    nameGap: 30,
+                    boundaryGap: false,
+                    axisLabel: {
+                        interval: function(index, value) {
+                            if (time.length > 60) {
+                                return index % Math.ceil(time.length / 20) === 0;
+                            }
+                            return true;
+                        },
+                        rotate: 30,
+                        hideOverlap: true
+                    }
+                },
+                yAxis: {
+                    type: 'value',
+                    name: '单位(b/s)',
+                    min: 'dataMin',
+                    max: 'dataMax',
+                    axisLabel: {
+                        interval: 'auto',
+                        rotate: 30,
+                        formatter: function(value) {
+                            return value.toLocaleString() + ' b/s';
+                        }
+                    }
+                },
+                series: buildSeries('recv')
+            });
+            // 表格渲染：合并左侧相同IP单元格
+            const last = data[data.length - 1] || [];
+            renderTable(last, peakMap);
+        } catch (e) {
+            sendChart.clear();
+            recvChart.clear();
+            document.getElementById('trafficTable').innerHTML = '';
+            console.error('数据获取失败', e);
+        }
+    }
+
+    // 首次加载
+    fetchAndUpdate();
+    // 每1秒自动刷新一次，保证坐标轴每秒推进
+    setInterval(fetchAndUpdate, 1000);
+    // 新增：WebSocket实时推送，收到后立即刷新
+    try {
+        const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+        const wsHost = location.hostname + ':5000';
+        const ws = new WebSocket(wsProto + '://' + wsHost + '/socket.io/?EIO=4&transport=websocket');
+        ws.onmessage = function(event) {
+            // 只要有stats_update事件就刷新
+            if (event.data && event.data.indexOf('stats_update') !== -1) {
+                fetchAndUpdate();
+            }
+        };
+    } catch (e) { console.warn('WebSocket连接失败', e); }
+
+    // 表格渲染：合并左侧相同IP单元格
+    function renderTable(last, peakMap) {
+        // 按ip分组，确保每个ip都有send和recv
+        const ipSet = new Set();
+        last.forEach(row => ipSet.add(row.ip));
+        const ipList = Array.from(ipSet);
+        // 构建每个ip的send/recv
+        const ipRows = ipList.map(ip => {
+            const send = last.find(r => r.ip === ip && r.direction === 'send');
+            const recv = last.find(r => r.ip === ip && r.direction === 'recv');
+            return {
+                ip,
+                send: send || {ip, direction: 'send', total: 0, avg2: 0, avg10: 0, avg40: 0, peak: 0},
+                recv: recv || {ip, direction: 'recv', total: 0, avg2: 0, avg10: 0, avg40: 0, peak: 0}
+            };
+        });
+        const table = document.getElementById('trafficTable');
+        table.innerHTML = ipRows.map(row => {
+            const sendPeak = peakMap.get(row.ip+'-send') || 0;
+            const recvPeak = peakMap.get(row.ip+'-recv') || 0;
+            return `
+                <tr>
+                    <td rowspan="2">${row.ip}</td>
+                    <td>发送</td>
+                    <td>${row.send.total}</td>
+                    <td>${sendPeak}</td>
+                    <td>${row.send.avg2}</td>
+                    <td>${row.send.avg10}</td>
+                    <td>${row.send.avg40}</td>
+                </tr>
+                <tr>
+                    <td>接收</td>
+                    <td>${row.recv.total}</td>
+                    <td>${recvPeak}</td>
+                    <td>${row.recv.avg2}</td>
+                    <td>${row.recv.avg10}</td>
+                    <td>${row.recv.avg40}</td>
+                </tr>
+            `;
+        }).join('');
+    }
+</script>
+</body>
+</html> 
